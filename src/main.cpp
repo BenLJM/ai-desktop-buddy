@@ -139,7 +139,7 @@ const uint8_t MENU_N = 6;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
-const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
+const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "screen rot", "ascii pet", "reset", "back" };
 const uint8_t SETTINGS_N = 10;
 
 bool    resetOpen = false;
@@ -474,6 +474,41 @@ static void drawClock() {
     }
   }
   M5.Lcd.setRotation(0);
+}
+
+// Push the sprite to the LCD, rotating into landscape when the device is
+// held sideways (e.g. worn as a watch on the wrist). Portrait uses the
+// fast path — a single framebuffer blit at rotation 0. Landscape uses
+// TFT_eSprite::pushRotated to map the 135x240 portrait content onto the
+// 240x135 landscape surface around both sprite and LCD pivots.
+//
+// The landscape clock face is drawn direct-to-LCD with optimized text and
+// skips this helper entirely (see the `if (landscapeClock)` branch in the
+// main loop). Everything else — buddy sprites, menus, info pages, pet
+// stats — renders into the portrait sprite and uses pushFrame() to show.
+static uint8_t pushOrient = 0;
+static void pushFrame() {
+  if (clockOrient == 0) {
+    if (pushOrient != 0) {
+      M5.Lcd.setRotation(0);
+      M5.Lcd.fillScreen(TFT_BLACK);
+      pushOrient = 0;
+    }
+    spr.pushSprite(0, 0);
+  } else {
+    if (pushOrient != clockOrient) {
+      M5.Lcd.setRotation(clockOrient);
+      M5.Lcd.fillScreen(TFT_BLACK);
+      pushOrient = clockOrient;
+    }
+    // Rotate the 135x240 sprite around its center into the 240x135 LCD
+    // centered at its center. 90 deg CW for clockOrient==1 (BtnA-side
+    // down), 90 deg CCW for clockOrient==3 (USB-side down).
+    spr.setPivot(W / 2, H / 2);
+    M5.Lcd.setPivot(M5.Lcd.width() / 2, M5.Lcd.height() / 2);
+    int16_t angle = (clockOrient == 1) ? 90 : -90;
+    spr.pushRotated(angle);
+  }
 }
 
 PersonaState derive(const TamaState& s) {
@@ -1151,8 +1186,11 @@ void loop() {
                && !menuOpen && !settingsOpen && !resetOpen && !inPrompt
                && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
                && dataRtcValid() && _onUsb;
-  if (clocking) clockUpdateOrient();
-  else { clockOrient = 0; orientFrames = 0; paintedOrient = 0; }
+  // Always run IMU-based orientation detection so the whole UI (menus,
+  // buddy, info pages) follows wrist angle, not just the clock face.
+  // settings().clockRot still controls the policy: 0=auto, 1=portrait lock,
+  // 2=landscape lock (see clockUpdateOrient).
+  clockUpdateOrient();
   bool landscapeClock = clocking && clockOrient != 0;
 
   static bool wasClocking = false;
@@ -1226,7 +1264,7 @@ void loop() {
     if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
     else if (menuOpen) drawMenu();
-    spr.pushSprite(0, 0);
+    pushFrame();
   }
 
   // Face-down nap: dim immediately, pause animations, accumulate sleep time.

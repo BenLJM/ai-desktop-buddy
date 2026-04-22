@@ -1013,7 +1013,7 @@ void setup() {
       spr.drawString("a buddy appears", W/2, H/2 + 12);
     }
     spr.setTextDatum(TL_DATUM); spr.setTextSize(1);
-    spr.pushSprite(0, 0);
+    pushFrame();
     delay(1800);
   }
 

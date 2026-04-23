@@ -148,7 +148,7 @@ inline void dataPoll(TamaState* out) {
   uint32_t now = millis();
 
   if (_demoMode) {
-    if (now >= _demoNext) { _demoIdx = (_demoIdx + 1) % 5; _demoNext = now + 8000; }
+    if (now >= _demoNext) { _demoIdx = (_demoIdx + 1) % 5; _demoNext = now + 12000; }
     const _Fake& s = _FAKES[_demoIdx];
     out->sessionsTotal=s.t; out->sessionsRunning=s.r; out->sessionsWaiting=s.w;
     out->recentlyCompleted=s.c; out->tokensToday=s.tok; out->lastUpdated=now;

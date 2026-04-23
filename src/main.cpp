@@ -5,7 +5,11 @@
 #include "data.h"
 #include "buddy.h"
 
-TFT_eSprite spr = TFT_eSprite(&M5.Lcd);
+TFT_eSprite spr = TFT_eSprite(&M5.Lcd);   // portrait 135x240 primary canvas.
+                                          // Landscape watch-view draws
+                                          // direct to LCD and doesn't use
+                                          // this sprite — see
+                                          // drawLandscapeMain().
 
 // Advertise as "Claude-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop picker. Name persists in
@@ -139,7 +143,7 @@ const uint8_t MENU_N = 6;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
-const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
+const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "screen rot", "ascii pet", "reset", "back" };
 const uint8_t SETTINGS_N = 10;
 
 bool    resetOpen = false;
@@ -473,7 +477,35 @@ static void drawClock() {
       characterRenderTo(&M5.Lcd, 57, 45);
     }
   }
-  M5.Lcd.setRotation(0);
+  // NOTE: deliberately leaves LCD at setRotation(clockOrient). Resetting
+  // to 0 here de-syncs pushFrame's cached `pushOrient` and makes the
+  // next push go to a rotation-0 LCD while pushFrame thinks it's in
+  // landscape. pushFrame re-applies rotation on the next transition.
+}
+
+// pushFrame blits the portrait sprite to the LCD, rotating via the
+// driver when the device is held landscape. Landscape centers the
+// 135-wide sprite inside the 240-wide logical frame — bottom 105 rows
+// of the portrait sprite clip by design (that's where menus live).
+// User sees all the buddy/hud content in landscape; menus require a
+// brief tilt back to portrait.
+//
+// Cached rotation: MADCTL writes race with pushSprite on the SPI bus
+// and tear, so only re-apply setRotation when the orientation actually
+// changes.
+static uint8_t pushOrient = 0;
+static void pushFrame() {
+  if (pushOrient != clockOrient) {
+    M5.Lcd.setRotation(clockOrient);
+    M5.Lcd.fillScreen(TFT_BLACK);
+    pushOrient = clockOrient;
+  }
+  if (clockOrient == 0) {
+    spr.pushSprite(0, 0);
+  } else {
+    // Center the 135-wide sprite on the 240-wide landscape LCD.
+    spr.pushSprite((M5.Lcd.width() - W) / 2, 0);
+  }
 }
 
 PersonaState derive(const TamaState& s) {
@@ -978,7 +1010,7 @@ void setup() {
       spr.drawString("a buddy appears", W/2, H/2 + 12);
     }
     spr.setTextDatum(TL_DATUM); spr.setTextSize(1);
-    spr.pushSprite(0, 0);
+    pushFrame();
     delay(1800);
   }
 
@@ -1151,8 +1183,11 @@ void loop() {
                && !menuOpen && !settingsOpen && !resetOpen && !inPrompt
                && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
                && dataRtcValid() && _onUsb;
-  if (clocking) clockUpdateOrient();
-  else { clockOrient = 0; orientFrames = 0; paintedOrient = 0; }
+  // Always run IMU-based orientation detection so the whole UI (menus,
+  // buddy, info pages) follows wrist angle, not just the clock face.
+  // settings().clockRot still controls the policy: 0=auto, 1=portrait lock,
+  // 2=landscape lock (see clockUpdateOrient).
+  clockUpdateOrient();
   bool landscapeClock = clocking && clockOrient != 0;
 
   static bool wasClocking = false;
@@ -1171,13 +1206,15 @@ void loop() {
     bool friday  = (dow == 5);
 
     uint8_t h = _clkTm.Hours;
+    // Mood cycles — periods bumped to >=12s per user request so action
+    // states dwell long enough to be enjoyed instead of flashing by.
     if (h >= 1 && h < 7)             activeState = P_SLEEP;
-    else if (weekend)                activeState = (now/8000 % 6 == 0) ? P_HEART : P_SLEEP;
-    else if (h < 9)                  activeState = (now/6000 % 4 == 0) ? P_IDLE  : P_SLEEP;
-    else if (h == 12)                activeState = (now/5000 % 3 == 0) ? P_HEART : P_IDLE;
-    else if (friday && h >= 15)      activeState = (now/4000 % 3 == 0) ? P_CELEBRATE : P_IDLE;
-    else if (h >= 22 || h == 0)      activeState = (now/7000 % 3 == 0) ? P_DIZZY : P_SLEEP;
-    else                             activeState = (now/10000 % 5 == 0) ? P_SLEEP : P_IDLE;
+    else if (weekend)                activeState = (now/12000 % 6 == 0) ? P_HEART : P_SLEEP;
+    else if (h < 9)                  activeState = (now/12000 % 4 == 0) ? P_IDLE  : P_SLEEP;
+    else if (h == 12)                activeState = (now/12000 % 3 == 0) ? P_HEART : P_IDLE;
+    else if (friday && h >= 15)      activeState = (now/12000 % 3 == 0) ? P_CELEBRATE : P_IDLE;
+    else if (h >= 22 || h == 0)      activeState = (now/12000 % 3 == 0) ? P_DIZZY : P_SLEEP;
+    else                             activeState = (now/12000 % 5 == 0) ? P_SLEEP : P_IDLE;
   }
 
   static uint32_t lastPasskey = 0;
@@ -1226,7 +1263,7 @@ void loop() {
     if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
     else if (menuOpen) drawMenu();
-    spr.pushSprite(0, 0);
+    pushFrame();
   }
 
   // Face-down nap: dim immediately, pause animations, accumulate sleep time.

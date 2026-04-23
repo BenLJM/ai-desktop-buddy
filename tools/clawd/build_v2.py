@@ -98,15 +98,68 @@ def composite_on_bg(rgba, bg=BG):
     return base
 
 
-def to_p(im_rgb):
-    return im_rgb.convert("P", palette=Image.ADAPTIVE, colors=64)
-
-
 def save_gif(rgba_frames, path, duration=120, loop=0):
-    p_frames = [to_p(composite_on_bg(f)) for f in rgba_frames]
+    """Write a multi-frame GIF the ESP32 AnimatedGIF decoder plays cleanly.
+
+    The on-device decoder doesn't clear previous-frame pixels when PIL
+    (or imageio) emits partial-patch frames — it crops each frame to
+    the diff bounding box, so new poses stack on top of old ones.
+
+    Force every frame to cover the full 96x100 canvas by:
+      1. Reserving palette index 0 = pure black (bg) and index 1 =
+         (1,1,1) — visually identical to black on the LCD.
+      2. Alternating pixel (0,0) and (W-1,H-1) between those two
+         indices per frame. PIL's diff bbox is forced to include both
+         corners, which spans the entire canvas.
+      3. Saving with disposal=1 (same as bufo) — at that point every
+         frame is a full replacement so the disposal choice is moot.
+    """
+    rgb_frames = [composite_on_bg(f) for f in rgba_frames]
+
+    # Shared palette across all frames so the decoder doesn't switch
+    # local color tables mid-loop (causes flicker on ESP32).
+    if len(rgb_frames) > 1:
+        fw, fh = rgb_frames[0].size
+        concat = Image.new("RGB", (fw * len(rgb_frames), fh))
+        for i, f in enumerate(rgb_frames):
+            concat.paste(f, (i * fw, 0))
+        ref = concat.convert("P", palette=Image.ADAPTIVE, colors=62)
+    else:
+        ref = rgb_frames[0].convert("P", palette=Image.ADAPTIVE, colors=62)
+
+    # Prepend two near-black entries so indices 0 and 1 are reserved for
+    # the anti-ghost corner markers. The quantized frames had referenced
+    # palette indices starting at 0; shift them up by 2 before writing.
+    src_pal = ref.getpalette()[: 3 * 62]       # 62 colors * 3 channels
+    new_pal = [0, 0, 0, 1, 1, 1] + src_pal     # 64 colors
+    # Pad to 256 * 3 so Pillow accepts it as a full GIF palette
+    new_pal = new_pal + [0] * (768 - len(new_pal))
+
+    p_frames = []
+    for rgb in rgb_frames:
+        # Quantize against `ref` to get indices in [0..61]
+        q = rgb.quantize(palette=ref, dither=Image.NONE)
+        # Shift indices up by 2 so they align with the new palette
+        data = bytes(b + 2 for b in q.tobytes())
+        shifted = Image.frombytes("P", q.size, data)
+        shifted.putpalette(new_pal)
+        p_frames.append(shifted)
+
+    # Alternate corner markers per frame so consecutive frames differ at
+    # both (0,0) and (W-1,H-1), forcing PIL's diff bbox to full canvas.
+    for i, f in enumerate(p_frames):
+        marker = i % 2          # 0 or 1, both map to (near-)black in new_pal
+        f.putpixel((0, 0), marker)
+        f.putpixel((f.width - 1, f.height - 1), marker)
+
     p_frames[0].save(
-        path, save_all=True, append_images=p_frames[1:],
-        duration=duration, loop=loop, disposal=2, optimize=True,
+        path,
+        save_all=True,
+        append_images=p_frames[1:],
+        duration=duration,
+        loop=loop,
+        disposal=1,
+        optimize=False,
     )
     print(f"{path.name}: {len(p_frames)} fr")
 
@@ -123,25 +176,28 @@ def frames_in_range(start, end, step=4):
 def main():
     extract_frames()
 
-    celebrate = frames_in_range(4, 42, step=4)
-    save_gif(celebrate, OUT_DIR / "celebrate.gif", duration=90)
+    # Source is 24 fps. step=2 => 12 fps on-device (smooth), step=4 =>
+    # 6 fps (jumpy). Previous iteration used step=4; bumped to step=2
+    # everywhere. Pack still ~300 KB, well under the 1.8 MB cap.
+    celebrate = frames_in_range(4, 44, step=2)        # ~20 fr
+    save_gif(celebrate, OUT_DIR / "celebrate.gif", duration=60)
 
-    heart = frames_in_range(65, 98, step=4)
-    save_gif(heart, OUT_DIR / "heart.gif", duration=100)
+    heart = frames_in_range(65, 98, step=2)           # ~17 fr
+    save_gif(heart, OUT_DIR / "heart.gif", duration=70)
 
-    attention = frames_in_range(112, 142, step=4)
-    save_gif(attention, OUT_DIR / "attention.gif", duration=110)
+    attention = frames_in_range(112, 142, step=2)     # ~15 fr
+    save_gif(attention, OUT_DIR / "attention.gif", duration=80)
 
-    busy = frames_in_range(162, 188, step=4)
-    save_gif(busy, OUT_DIR / "busy.gif", duration=95)
+    busy = frames_in_range(162, 188, step=2)          # ~13 fr
+    save_gif(busy, OUT_DIR / "busy.gif", duration=65)
 
-    rest = frames_in_range(48, 60, step=2) + frames_in_range(146, 156, step=2)
+    rest = frames_in_range(48, 60, step=1) + frames_in_range(146, 156, step=1)
     if not rest:
         rest = frames_in_range(150, 156, step=1)
     for i in range(9):
-        offset = i % len(rest)
-        idle_i = [rest[(offset + j) % len(rest)] for j in range(4)]
-        save_gif(idle_i, OUT_DIR / f"idle_{i}.gif", duration=160)
+        offset = (i * 2) % len(rest)
+        idle_i = [rest[(offset + j) % len(rest)] for j in range(8)]
+        save_gif(idle_i, OUT_DIR / f"idle_{i}.gif", duration=90)
 
     # Dizzy & sleep have no motion in the video; use the static sticker.
     dizzy_src = fit_to_canvas(load_and_clean(SRC_DIR / "clawd_dizzy.png"))

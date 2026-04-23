@@ -5,11 +5,11 @@
 #include "data.h"
 #include "buddy.h"
 
-TFT_eSprite spr  = TFT_eSprite(&M5.Lcd);   // portrait 135x240 primary canvas
-TFT_eSprite sprL = TFT_eSprite(&M5.Lcd);   // landscape 240x135 rotated mirror
-                                           // of spr, allocated lazily and
-                                           // only if heap allows.
-static bool sprLOk = false;
+TFT_eSprite spr = TFT_eSprite(&M5.Lcd);   // portrait 135x240 primary canvas.
+                                          // Landscape watch-view draws
+                                          // direct to LCD and doesn't use
+                                          // this sprite — see
+                                          // drawLandscapeMain().
 
 // Advertise as "Claude-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop picker. Name persists in
@@ -483,67 +483,92 @@ static void drawClock() {
   // landscape. pushFrame re-applies rotation on the next transition.
 }
 
-// Push the sprite to the LCD.
-//
-// Portrait (clockOrient == 0): direct pushSprite of spr, cached
-// setRotation — we must NOT call setRotation on every frame, it races
-// with pushSprite on the SPI bus and causes visible tearing.
-//
-// Landscape (clockOrient == 1 or 3): rotate spr (135x240) into sprL
-// (240x135) via pixel copy, then setRotation(clockOrient) and
-// pushSprite sprL. Pure CPU rotation sidesteps the broken
-// pushRotated-into-sprite path on this M5StickCPlus TFT fork. Device
-// physically rotated 90° on the wrist + content rotated 90° in sprL
-// = content appears upright to the user, all UI elements visible.
-//
-// If sprL allocation failed at boot (tight heap), landscape silently
-// falls back to portrait push — no black screen.
-//
-// The landscape clock face (drawClock) still draws direct-to-LCD with
-// optimized per-glyph updates and skips this helper entirely.
+// pushFrame always blits the portrait sprite at setRotation(0). Every
+// menu / info / settings / boot-splash screen is designed in portrait
+// and uses this path. Landscape watch-view renders direct-to-LCD via
+// drawLandscapeMain() and bypasses this helper entirely (see main
+// loop). pushFrame stays simple on purpose — past attempts to overload
+// it for landscape (pushRotated, sprL pixel copy) interacted badly
+// with the driver's setRotation and produced either 180° flips or a
+// black screen.
 static uint8_t pushOrient = 0;
 static void pushFrame() {
-  uint8_t target = (clockOrient != 0 && sprLOk) ? clockOrient : 0;
-  if (pushOrient != target) {
-    M5.Lcd.setRotation(target);
+  if (pushOrient != 0) {
+    M5.Lcd.setRotation(0);
     M5.Lcd.fillScreen(TFT_BLACK);
-    pushOrient = target;
+    pushOrient = 0;
   }
-  if (target == 0) {
-    spr.pushSprite(0, 0);
-    return;
+  spr.pushSprite(0, 0);
+}
+
+// Landscape "watch" view: buddy on the left, status on the right, time
+// centered above status when the RTC is valid. Drawn direct to LCD in
+// the setRotation(clockOrient) 240x135 coord space — same proven
+// pattern as drawClock's landscape branch. Called from the main loop
+// only in DISP_NORMAL with no menu / info / session overlays.
+static uint8_t landPaintedOrient = 0;
+static void drawLandscapeMain() {
+  const Palette& p = characterPalette();
+  if (pushOrient != clockOrient) {
+    M5.Lcd.setRotation(clockOrient);
+    M5.Lcd.fillScreen(p.bg);
+    pushOrient = clockOrient;
+    landPaintedOrient = clockOrient;
   }
 
-  // Pixel-rotate spr -> sprL. For clockOrient==1 (BtnA-side down
-  // landscape): 90° CCW so the portrait "top" lands on the user's LEFT
-  // when worn on a left wrist with USB pointing at the fingers.
-  // clockOrient==3 mirrors it for the other wrist orientation.
-  //
-  // Accesses the raw 16-bit buffers directly for speed — readPixel /
-  // drawPixel add ~3x overhead from bounds checks and calling convention.
-  uint16_t* srcBuf = (uint16_t*)spr.frameBuffer(1);
-  uint16_t* dstBuf = (uint16_t*)sprL.frameBuffer(1);
-  if (srcBuf && dstBuf) {
-    if (clockOrient == 1) {
-      // (sx, sy) -> (sy, W-1-sx)      sprL size = H x W
-      for (int sy = 0; sy < H; sy++) {
-        const uint16_t* srow = srcBuf + sy * W;
-        for (int sx = 0; sx < W; sx++) {
-          dstBuf[sy + (W - 1 - sx) * H] = srow[sx];
-        }
-      }
+  // Pet on left (<=115 wide) at 5 fps. Matches drawClock landscape.
+  static uint32_t lastPetTick = 0;
+  uint32_t now = millis();
+  if (now - lastPetTick >= 200) {
+    lastPetTick = now;
+    if (buddyMode) {
+      M5.Lcd.fillRect(0, 0, 115, 90, p.bg);
+      buddyRenderTo(&M5.Lcd, activeState);
     } else {
-      // clockOrient == 3: (sx, sy) -> (H-1-sy, sx)
-      for (int sy = 0; sy < H; sy++) {
-        const uint16_t* srow = srcBuf + sy * W;
-        int dy_base = H - 1 - sy;
-        for (int sx = 0; sx < W; sx++) {
-          dstBuf[dy_base + sx * H] = srow[sx];
-        }
-      }
+      characterSetState(activeState);
+      characterRenderTo(&M5.Lcd, 57, 45);
     }
   }
-  sprL.pushSprite(0, 0);
+
+  // Right column: stats + connection state. Updated at 1 Hz.
+  static uint32_t lastStatTick = 0;
+  if (now - lastStatTick >= 1000) {
+    lastStatTick = now;
+    M5.Lcd.fillRect(125, 0, 240 - 125, 135, p.bg);
+    M5.Lcd.setTextDatum(TL_DATUM);
+    M5.Lcd.setTextSize(1);
+
+    int y = 8;
+    if (dataRtcValid()) {
+      char hm[6];
+      snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.Hours, _clkTm.Minutes);
+      M5.Lcd.setTextSize(3);
+      M5.Lcd.setTextColor(p.text, p.bg);
+      M5.Lcd.drawString(hm, 130, y);
+      y += 28;
+      M5.Lcd.setTextSize(1);
+    }
+
+    M5.Lcd.setTextColor(p.textDim, p.bg);
+    if (!bleConnected())       M5.Lcd.drawString("no claude", 130, y);
+    else if (bleSecure())      M5.Lcd.drawString("claude \x03", 130, y);
+    else                       M5.Lcd.drawString("claude (open)", 130, y);
+    y += 12;
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "ses %u", tama.sessionsTotal);
+    M5.Lcd.drawString(buf, 130, y); y += 12;
+    snprintf(buf, sizeof(buf), "run %u", tama.sessionsRunning);
+    M5.Lcd.drawString(buf, 130, y); y += 12;
+    snprintf(buf, sizeof(buf), "lvl %u", (unsigned)stats().level);
+
+    // Battery %
+    int vBat_mV = (int)(M5.Axp.GetBatVoltage() * 1000);
+    int pct = (vBat_mV - 3200) / 10;
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    snprintf(buf, sizeof(buf), "bat %d%%", pct);
+    M5.Lcd.drawString(buf, 130, y + 12);
+  }
 }
 
 PersonaState derive(const TamaState& s) {
@@ -1022,17 +1047,6 @@ void setup() {
 
   // BLE stays always-on; s.bt is stored as a preference only.
   spr.createSprite(W, H);
-
-  // Landscape sibling sprite — pushFrame pixel-rotates spr into this
-  // when clockOrient != 0 and blits it. If the allocation fails (tight
-  // heap under BLE + LittleFS), flag it off and fall back to portrait
-  // even when the user locks land. 240*135*2 = 64800 B.
-  if (sprL.createSprite(H, W) != nullptr) {
-    sprLOk = true;
-    sprL.fillSprite(TFT_BLACK);
-  }
-  Serial.printf("[lcd] spr=%u sprL=%s heap=%u\n",
-                W * H * 2, sprLOk ? "ok" : "FAIL", ESP.getFreeHeap());
   characterInit(nullptr);  // scan /characters/ for whatever is installed
   gifAvailable = characterLoaded();
   // species NVS: 0..N-1 = ASCII species, 0xFF = use GIF (also the default,
@@ -1238,16 +1252,26 @@ void loop() {
   // 2=landscape lock (see clockUpdateOrient).
   clockUpdateOrient();
   bool landscapeClock = clocking && clockOrient != 0;
+  // Landscape "watch" main view: same landscape direct-to-LCD render
+  // pattern as landscapeClock, but fires on battery too — whenever the
+  // user locks `land` (or tilts enough in auto) AND there's no overlay
+  // fighting for the screen. Menus, settings, info, passkey pairing,
+  // and pet pages all force portrait so portrait-only UI stays usable.
+  bool landscapeMain = (clockOrient != 0)
+                    && displayMode == DISP_NORMAL
+                    && !menuOpen && !settingsOpen && !resetOpen
+                    && !inPrompt && !blePasskey();
 
   static bool wasClocking = false;
   static bool wasLandscape = false;
-  if (clocking != wasClocking || landscapeClock != wasLandscape) {
-    if (clocking && !landscapeClock) characterSetPeek(true);
+  bool landscapeAny = landscapeMain || landscapeClock;
+  if (clocking != wasClocking || landscapeAny != wasLandscape) {
+    if (clocking && !landscapeAny) characterSetPeek(true);
     else applyDisplayMode();
     characterInvalidate();
     if (buddyMode) buddyInvalidate();
     wasClocking = clocking;
-    wasLandscape = landscapeClock;
+    wasLandscape = landscapeAny;
   }
   if (clocking) {
     uint8_t dow = clockDow();
@@ -1271,8 +1295,8 @@ void loop() {
   if (pk && !lastPasskey) { wake(); beep(1800, 60); }
   lastPasskey = pk;
 
-  if (napping || screenOff || landscapeClock) {
-    // skip sprite render — face-down, powered off, or landscape clock
+  if (napping || screenOff || landscapeClock || landscapeMain) {
+    // skip sprite render — face-down, powered off, or landscape view
     // (which draws direct-to-LCD below)
   } else if (buddyMode) {
     buddyTick(activeState);
@@ -1303,6 +1327,8 @@ void loop() {
   }
   if (landscapeClock) {
     drawClock();
+  } else if (landscapeMain) {
+    drawLandscapeMain();
   } else if (!napping && !screenOff) {
     if (blePasskey()) drawPasskey();
     else if (clocking) drawClock();

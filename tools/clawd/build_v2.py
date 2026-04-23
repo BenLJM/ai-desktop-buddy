@@ -65,8 +65,8 @@ def extract_frames():
     )
 
 
-def load_and_clean(path: Path) -> Image.Image:
-    """Load, make the light-grey studio background transparent, crop to content."""
+def load_rgba(path: Path) -> Image.Image:
+    """Load frame and punch out the grey studio background to transparent."""
     im = Image.open(path).convert("RGBA")
     arr = np.array(im)
     r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
@@ -74,11 +74,53 @@ def load_and_clean(path: Path) -> Image.Image:
     dgb = np.abs(g.astype(int) - b.astype(int))
     is_grey = (drg < 10) & (dgb < 10) & (r >= 210) & (r <= 250)
     arr[is_grey, 3] = 0
-    out = Image.fromarray(arr, "RGBA")
-    bbox = out.getbbox()
-    if bbox:
-        out = out.crop(bbox)
+    return Image.fromarray(arr, "RGBA")
+
+
+def union_bbox(*paths: Path) -> tuple:
+    """Compute the bbox that covers content in every listed frame.
+
+    Each frame is cropped to its own bbox separately during quick
+    preview, but the GIF pack needs a SHARED bbox — otherwise each
+    frame's character gets scaled to fit 96x100 independently and the
+    character visibly changes size between frames (the 'big-small
+    jitter' the user reported).
+    """
+    left = top = None
+    right = bottom = 0
+    for p in paths:
+        im = load_rgba(p)
+        bb = im.getbbox()
+        if bb is None:
+            continue
+        l, t, r, b = bb
+        left   = l if left   is None else min(left,   l)
+        top    = t if top    is None else min(top,    t)
+        right  = max(right, r)
+        bottom = max(bottom, b)
+    return (left or 0, top or 0, right, bottom)
+
+
+def fit_with_bbox(im: Image.Image, bbox, canvas=CANVAS, margin=2) -> Image.Image:
+    """Crop to shared bbox and scale to canvas — constant scale across all frames."""
+    w, h = canvas
+    cropped = im.crop(bbox)
+    cw, ch = cropped.size
+    scale = min((w - 2 * margin) / cw, (h - 2 * margin) / ch)
+    nw, nh = max(1, int(cw * scale)), max(1, int(ch * scale))
+    resized = cropped.resize((nw, nh), Image.NEAREST)
+    out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    out.paste(resized, ((w - nw) // 2, (h - nh) // 2), resized)
     return out
+
+
+# Legacy single-frame wrapper — still used for the static dizzy sticker.
+def load_and_clean(path: Path) -> Image.Image:
+    im = load_rgba(path)
+    bbox = im.getbbox()
+    if bbox:
+        im = im.crop(bbox)
+    return im
 
 
 def fit_to_canvas(im: Image.Image, canvas=CANVAS, margin=2) -> Image.Image:
@@ -164,39 +206,65 @@ def save_gif(rgba_frames, path, duration=120, loop=0):
     print(f"{path.name}: {len(p_frames)} fr")
 
 
-def frames_in_range(start, end, step=4):
+def frame_paths(start, end, step=4):
+    return [FRAMES / f"f_{i:03d}.png"
+            for i in range(start, end + 1, step)
+            if (FRAMES / f"f_{i:03d}.png").exists()]
+
+
+def frames_in_range(start, end, step=4, bbox=None):
+    """Load frames cropped to a shared bbox (so character stays same size)."""
     out = []
-    for i in range(start, end + 1, step):
-        p = FRAMES / f"f_{i:03d}.png"
-        if p.exists():
-            out.append(fit_to_canvas(load_and_clean(p)))
+    for p in frame_paths(start, end, step):
+        rgba = load_rgba(p)
+        if bbox is not None:
+            out.append(fit_with_bbox(rgba, bbox))
+        else:
+            # Legacy self-cropping fallback
+            bb = rgba.getbbox()
+            if bb:
+                rgba = rgba.crop(bb)
+            out.append(fit_to_canvas(rgba))
     return out
 
 
 def main():
     extract_frames()
 
+    # Compute a SHARED content bbox across every frame we'll actually
+    # use. This locks the character size for the whole pack — without
+    # it, each frame's bbox is tight around its own pose, so wide poses
+    # (arms out) get scaled smaller than narrow poses (standing).
+    # Result was a visible "big-small" jitter between frames.
+    all_paths = (
+        frame_paths(4, 44, 3) +
+        frame_paths(65, 98, 3) +
+        frame_paths(112, 142, 3) +
+        frame_paths(162, 188, 3) +
+        frame_paths(48, 60, 2) +
+        frame_paths(146, 156, 2)
+    )
+    shared_bbox = union_bbox(*all_paths)
+    print(f"shared bbox: {shared_bbox} size={shared_bbox[2]-shared_bbox[0]}x{shared_bbox[3]-shared_bbox[1]}")
+
     # ESP32 AnimatedGIF + full-frame 96x100 + SPI LCD + LittleFS I/O
-    # leaves ~150ms/frame realistic budget. Past experience: too-fast
-    # durations (60-90ms) cause visible jitter as the decoder falls
-    # behind and catches up unevenly. 140ms per frame gives stable ~7
-    # fps playback; source is 24 fps so picking every 3rd frame (step=3)
-    # gives 8 fps capture, matched to display budget.
-    celebrate = frames_in_range(4, 44, step=3)        # ~14 fr
+    # leaves ~150ms/frame realistic budget. 140ms/frame = stable 7 fps.
+    celebrate = frames_in_range(4, 44, step=3, bbox=shared_bbox)
     save_gif(celebrate, OUT_DIR / "celebrate.gif", duration=140)
 
-    heart = frames_in_range(65, 98, step=3)           # ~12 fr
+    heart = frames_in_range(65, 98, step=3, bbox=shared_bbox)
     save_gif(heart, OUT_DIR / "heart.gif", duration=140)
 
-    attention = frames_in_range(112, 142, step=3)     # ~11 fr
+    attention = frames_in_range(112, 142, step=3, bbox=shared_bbox)
     save_gif(attention, OUT_DIR / "attention.gif", duration=140)
 
-    busy = frames_in_range(162, 188, step=3)          # ~9 fr
+    busy = frames_in_range(162, 188, step=3, bbox=shared_bbox)
     save_gif(busy, OUT_DIR / "busy.gif", duration=140)
 
-    rest = frames_in_range(48, 60, step=2) + frames_in_range(146, 156, step=2)
+    rest = (frames_in_range(48, 60, step=2, bbox=shared_bbox) +
+            frames_in_range(146, 156, step=2, bbox=shared_bbox))
     if not rest:
-        rest = frames_in_range(150, 156, step=1)
+        rest = frames_in_range(150, 156, step=1, bbox=shared_bbox)
     for i in range(9):
         offset = (i * 2) % len(rest)
         idle_i = [rest[(offset + j) % len(rest)] for j in range(5)]

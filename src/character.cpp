@@ -56,7 +56,7 @@ static void gifPlace() {
 static uint32_t    nextFrameAt = 0;
 static uint32_t    animPauseUntil = 0;
 static uint32_t    variantStartedMs = 0;
-static const uint32_t VARIANT_DWELL_MS = 5000;
+static const uint32_t VARIANT_DWELL_MS = 12000;   // ~12 s per idle variant
 static const uint32_t ANIM_PAUSE_MS    = 800;
 static bool        gifOpen = false;
 

@@ -5,7 +5,11 @@
 #include "data.h"
 #include "buddy.h"
 
-TFT_eSprite spr = TFT_eSprite(&M5.Lcd);
+TFT_eSprite spr  = TFT_eSprite(&M5.Lcd);   // portrait 135x240 primary canvas
+TFT_eSprite sprL = TFT_eSprite(&M5.Lcd);   // landscape 240x135 rotated mirror
+                                           // of spr, allocated lazily and
+                                           // only if heap allows.
+static bool sprLOk = false;
 
 // Advertise as "Claude-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop picker. Name persists in
@@ -481,40 +485,65 @@ static void drawClock() {
 
 // Push the sprite to the LCD.
 //
-// Portrait (clockOrient == 0): fast-path blit, cached setRotation — we
-// must NOT call setRotation on every frame, it races with pushSprite on
-// the SPI bus and the screen tears/flickers.
+// Portrait (clockOrient == 0): direct pushSprite of spr, cached
+// setRotation — we must NOT call setRotation on every frame, it races
+// with pushSprite on the SPI bus and causes visible tearing.
 //
-// Landscape (clockOrient == 1 or 3): just flip the LCD driver via
-// setRotation(1|3). The portrait sprite (135x240) gets drawn at (0,0)
-// into the rotated 240x135 coord space — the bottom 105 rows of the
-// sprite (y > 134) are clipped by the driver, which is where the
-// menu/info text lives. The buddy (y: 0..110) lands in the upper-left
-// region of the landscape view. Accept the clip for wrist-wear: tilt
-// back to portrait to access menus. Centered horizontally by starting
-// the blit at x = (240-135)/2 = 52.
+// Landscape (clockOrient == 1 or 3): rotate spr (135x240) into sprL
+// (240x135) via pixel copy, then setRotation(clockOrient) and
+// pushSprite sprL. Pure CPU rotation sidesteps the broken
+// pushRotated-into-sprite path on this M5StickCPlus TFT fork. Device
+// physically rotated 90° on the wrist + content rotated 90° in sprL
+// = content appears upright to the user, all UI elements visible.
 //
-// A prior two-sprite approach (rotate `spr` into `sprL`, push sprL)
-// produced a black screen on-device: pushRotated into another sprite
-// may not be reliable on this M5StickCPlus TFT fork, and the extra
-// 64 KB sprite pushed the heap close to capacity under BLE + LittleFS.
+// If sprL allocation failed at boot (tight heap), landscape silently
+// falls back to portrait push — no black screen.
 //
 // The landscape clock face (drawClock) still draws direct-to-LCD with
 // optimized per-glyph updates and skips this helper entirely.
 static uint8_t pushOrient = 0;
 static void pushFrame() {
-  if (pushOrient != clockOrient) {
-    M5.Lcd.setRotation(clockOrient);
+  uint8_t target = (clockOrient != 0 && sprLOk) ? clockOrient : 0;
+  if (pushOrient != target) {
+    M5.Lcd.setRotation(target);
     M5.Lcd.fillScreen(TFT_BLACK);
-    pushOrient = clockOrient;
+    pushOrient = target;
   }
-  if (clockOrient == 0) {
+  if (target == 0) {
     spr.pushSprite(0, 0);
-  } else {
-    // Center the 135-wide sprite inside the 240-wide landscape LCD,
-    // bottom of sprite clips off (by design — that's where menus live).
-    spr.pushSprite((M5.Lcd.width() - W) / 2, 0);
+    return;
   }
+
+  // Pixel-rotate spr -> sprL. For clockOrient==1 (BtnA-side down
+  // landscape): 90° CCW so the portrait "top" lands on the user's LEFT
+  // when worn on a left wrist with USB pointing at the fingers.
+  // clockOrient==3 mirrors it for the other wrist orientation.
+  //
+  // Accesses the raw 16-bit buffers directly for speed — readPixel /
+  // drawPixel add ~3x overhead from bounds checks and calling convention.
+  uint16_t* srcBuf = (uint16_t*)spr.frameBuffer(1);
+  uint16_t* dstBuf = (uint16_t*)sprL.frameBuffer(1);
+  if (srcBuf && dstBuf) {
+    if (clockOrient == 1) {
+      // (sx, sy) -> (sy, W-1-sx)      sprL size = H x W
+      for (int sy = 0; sy < H; sy++) {
+        const uint16_t* srow = srcBuf + sy * W;
+        for (int sx = 0; sx < W; sx++) {
+          dstBuf[sy + (W - 1 - sx) * H] = srow[sx];
+        }
+      }
+    } else {
+      // clockOrient == 3: (sx, sy) -> (H-1-sy, sx)
+      for (int sy = 0; sy < H; sy++) {
+        const uint16_t* srow = srcBuf + sy * W;
+        int dy_base = H - 1 - sy;
+        for (int sx = 0; sx < W; sx++) {
+          dstBuf[dy_base + sx * H] = srow[sx];
+        }
+      }
+    }
+  }
+  sprL.pushSprite(0, 0);
 }
 
 PersonaState derive(const TamaState& s) {
@@ -993,6 +1022,17 @@ void setup() {
 
   // BLE stays always-on; s.bt is stored as a preference only.
   spr.createSprite(W, H);
+
+  // Landscape sibling sprite — pushFrame pixel-rotates spr into this
+  // when clockOrient != 0 and blits it. If the allocation fails (tight
+  // heap under BLE + LittleFS), flag it off and fall back to portrait
+  // even when the user locks land. 240*135*2 = 64800 B.
+  if (sprL.createSprite(H, W) != nullptr) {
+    sprLOk = true;
+    sprL.fillSprite(TFT_BLACK);
+  }
+  Serial.printf("[lcd] spr=%u sprL=%s heap=%u\n",
+                W * H * 2, sprLOk ? "ok" : "FAIL", ESP.getFreeHeap());
   characterInit(nullptr);  // scan /characters/ for whatever is installed
   gifAvailable = characterLoaded();
   // species NVS: 0..N-1 = ASCII species, 0xFF = use GIF (also the default,
@@ -1215,13 +1255,15 @@ void loop() {
     bool friday  = (dow == 5);
 
     uint8_t h = _clkTm.Hours;
+    // Mood cycles — periods bumped to >=12s per user request so action
+    // states dwell long enough to be enjoyed instead of flashing by.
     if (h >= 1 && h < 7)             activeState = P_SLEEP;
-    else if (weekend)                activeState = (now/8000 % 6 == 0) ? P_HEART : P_SLEEP;
-    else if (h < 9)                  activeState = (now/6000 % 4 == 0) ? P_IDLE  : P_SLEEP;
-    else if (h == 12)                activeState = (now/5000 % 3 == 0) ? P_HEART : P_IDLE;
-    else if (friday && h >= 15)      activeState = (now/4000 % 3 == 0) ? P_CELEBRATE : P_IDLE;
-    else if (h >= 22 || h == 0)      activeState = (now/7000 % 3 == 0) ? P_DIZZY : P_SLEEP;
-    else                             activeState = (now/10000 % 5 == 0) ? P_SLEEP : P_IDLE;
+    else if (weekend)                activeState = (now/12000 % 6 == 0) ? P_HEART : P_SLEEP;
+    else if (h < 9)                  activeState = (now/12000 % 4 == 0) ? P_IDLE  : P_SLEEP;
+    else if (h == 12)                activeState = (now/12000 % 3 == 0) ? P_HEART : P_IDLE;
+    else if (friday && h >= 15)      activeState = (now/12000 % 3 == 0) ? P_CELEBRATE : P_IDLE;
+    else if (h >= 22 || h == 0)      activeState = (now/12000 % 3 == 0) ? P_DIZZY : P_SLEEP;
+    else                             activeState = (now/12000 % 5 == 0) ? P_SLEEP : P_IDLE;
   }
 
   static uint32_t lastPasskey = 0;

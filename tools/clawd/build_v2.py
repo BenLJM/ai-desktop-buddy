@@ -176,28 +176,31 @@ def frames_in_range(start, end, step=4):
 def main():
     extract_frames()
 
-    # Source is 24 fps. step=2 => 12 fps on-device (smooth), step=4 =>
-    # 6 fps (jumpy). Previous iteration used step=4; bumped to step=2
-    # everywhere. Pack still ~300 KB, well under the 1.8 MB cap.
-    celebrate = frames_in_range(4, 44, step=2)        # ~20 fr
-    save_gif(celebrate, OUT_DIR / "celebrate.gif", duration=60)
+    # ESP32 AnimatedGIF + full-frame 96x100 + SPI LCD + LittleFS I/O
+    # leaves ~150ms/frame realistic budget. Past experience: too-fast
+    # durations (60-90ms) cause visible jitter as the decoder falls
+    # behind and catches up unevenly. 140ms per frame gives stable ~7
+    # fps playback; source is 24 fps so picking every 3rd frame (step=3)
+    # gives 8 fps capture, matched to display budget.
+    celebrate = frames_in_range(4, 44, step=3)        # ~14 fr
+    save_gif(celebrate, OUT_DIR / "celebrate.gif", duration=140)
 
-    heart = frames_in_range(65, 98, step=2)           # ~17 fr
-    save_gif(heart, OUT_DIR / "heart.gif", duration=70)
+    heart = frames_in_range(65, 98, step=3)           # ~12 fr
+    save_gif(heart, OUT_DIR / "heart.gif", duration=140)
 
-    attention = frames_in_range(112, 142, step=2)     # ~15 fr
-    save_gif(attention, OUT_DIR / "attention.gif", duration=80)
+    attention = frames_in_range(112, 142, step=3)     # ~11 fr
+    save_gif(attention, OUT_DIR / "attention.gif", duration=140)
 
-    busy = frames_in_range(162, 188, step=2)          # ~13 fr
-    save_gif(busy, OUT_DIR / "busy.gif", duration=65)
+    busy = frames_in_range(162, 188, step=3)          # ~9 fr
+    save_gif(busy, OUT_DIR / "busy.gif", duration=140)
 
-    rest = frames_in_range(48, 60, step=1) + frames_in_range(146, 156, step=1)
+    rest = frames_in_range(48, 60, step=2) + frames_in_range(146, 156, step=2)
     if not rest:
         rest = frames_in_range(150, 156, step=1)
     for i in range(9):
         offset = (i * 2) % len(rest)
-        idle_i = [rest[(offset + j) % len(rest)] for j in range(8)]
-        save_gif(idle_i, OUT_DIR / f"idle_{i}.gif", duration=90)
+        idle_i = [rest[(offset + j) % len(rest)] for j in range(5)]
+        save_gif(idle_i, OUT_DIR / f"idle_{i}.gif", duration=160)
 
     # Dizzy & sleep have no motion in the video; use the static sticker.
     dizzy_src = fit_to_canvas(load_and_clean(SRC_DIR / "clawd_dizzy.png"))

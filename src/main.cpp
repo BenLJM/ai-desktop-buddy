@@ -5,12 +5,7 @@
 #include "data.h"
 #include "buddy.h"
 
-TFT_eSprite spr  = TFT_eSprite(&M5.Lcd);   // portrait 135x240, drawn by every UI path
-TFT_eSprite sprL = TFT_eSprite(&M5.Lcd);   // landscape 240x135, pushFrame fills it by
-                                           // rotating `spr` into it, then blits to LCD.
-                                           // Decouples sprite rotation from LCD
-                                           // rotation — avoids the pushRotated-over-
-                                           // rotated-LCD double transform.
+TFT_eSprite spr = TFT_eSprite(&M5.Lcd);
 
 // Advertise as "Claude-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop picker. Name persists in
@@ -478,56 +473,48 @@ static void drawClock() {
       characterRenderTo(&M5.Lcd, 57, 45);
     }
   }
-  M5.Lcd.setRotation(0);
+  // NOTE: deliberately leaves LCD at setRotation(clockOrient). Resetting
+  // to 0 here de-syncs pushFrame's cached `pushOrient` and makes the
+  // next push go to a rotation-0 LCD while pushFrame thinks it's in
+  // landscape. pushFrame re-applies rotation on the next transition.
 }
 
-// Push the sprite to the LCD, rotating into landscape when the device is
-// held sideways (e.g. worn as a watch on the wrist).
+// Push the sprite to the LCD.
 //
-// Portrait path: LCD setRotation(0) + single framebuffer blit of `spr`.
+// Portrait (clockOrient == 0): fast-path blit, cached setRotation — we
+// must NOT call setRotation on every frame, it races with pushSprite on
+// the SPI bus and the screen tears/flickers.
 //
-// Landscape path: rotate `spr` (135x240) into `sprL` (240x135) in-memory,
-// then setRotation(1|3) and plain pushSprite(0,0). The driver handles the
-// physical flip for 1 vs 3. Rotating sprite-to-sprite decouples the two
-// rotation stages — pushRotated directly to an already-rotated LCD
-// double-transforms and was producing a 180-flipped portrait on wrist.
+// Landscape (clockOrient == 1 or 3): just flip the LCD driver via
+// setRotation(1|3). The portrait sprite (135x240) gets drawn at (0,0)
+// into the rotated 240x135 coord space — the bottom 105 rows of the
+// sprite (y > 134) are clipped by the driver, which is where the
+// menu/info text lives. The buddy (y: 0..110) lands in the upper-left
+// region of the landscape view. Accept the clip for wrist-wear: tilt
+// back to portrait to access menus. Centered horizontally by starting
+// the blit at x = (240-135)/2 = 52.
 //
-// The landscape clock face draws direct-to-LCD with optimized per-glyph
-// updates and skips this helper (see `if (landscapeClock)` in the main
-// loop). Everything else — buddy sprites, menus, info pages, pet stats —
-// renders into the portrait sprite and uses pushFrame() to show.
-// Tracks the last rotation we told the LCD. External code (e.g. drawClock
-// landscape path) also calls setRotation, so the guard here is only to
-// avoid redundant fillScreen calls — we always re-apply setRotation.
+// A prior two-sprite approach (rotate `spr` into `sprL`, push sprL)
+// produced a black screen on-device: pushRotated into another sprite
+// may not be reliable on this M5StickCPlus TFT fork, and the extra
+// 64 KB sprite pushed the heap close to capacity under BLE + LittleFS.
+//
+// The landscape clock face (drawClock) still draws direct-to-LCD with
+// optimized per-glyph updates and skips this helper entirely.
 static uint8_t pushOrient = 0;
 static void pushFrame() {
-  if (clockOrient == 0) {
-    M5.Lcd.setRotation(0);
-    if (pushOrient != 0) {
-      M5.Lcd.fillScreen(TFT_BLACK);
-      pushOrient = 0;
-    }
-    spr.pushSprite(0, 0);
-    return;
-  }
-
-  // Rotate portrait `spr` into landscape `sprL` around matching centers.
-  // 90 deg CW for clockOrient==1 (BtnA-side down), 90 deg CCW for
-  // clockOrient==3 (USB-side down). pushRotated(dst, angle) writes into
-  // the destination sprite instead of the LCD, so no LCD rotation state
-  // leaks into the rotation math.
-  sprL.fillSprite(TFT_BLACK);
-  spr.setPivot(W / 2, H / 2);
-  sprL.setPivot(H / 2, W / 2);   // 120, 67 — center of 240x135
-  int16_t angle = (clockOrient == 1) ? 90 : -90;
-  spr.pushRotated(&sprL, angle);
-
-  M5.Lcd.setRotation(clockOrient);
   if (pushOrient != clockOrient) {
+    M5.Lcd.setRotation(clockOrient);
     M5.Lcd.fillScreen(TFT_BLACK);
     pushOrient = clockOrient;
   }
-  sprL.pushSprite(0, 0);
+  if (clockOrient == 0) {
+    spr.pushSprite(0, 0);
+  } else {
+    // Center the 135-wide sprite inside the 240-wide landscape LCD,
+    // bottom of sprite clips off (by design — that's where menus live).
+    spr.pushSprite((M5.Lcd.width() - W) / 2, 0);
+  }
 }
 
 PersonaState derive(const TamaState& s) {
@@ -1006,8 +993,6 @@ void setup() {
 
   // BLE stays always-on; s.bt is stored as a preference only.
   spr.createSprite(W, H);
-  sprL.createSprite(H, W);   // 240x135 landscape sibling of spr
-  sprL.fillSprite(TFT_BLACK);
   characterInit(nullptr);  // scan /characters/ for whatever is installed
   gifAvailable = characterLoaded();
   // species NVS: 0..N-1 = ASCII species, 0xFF = use GIF (also the default,

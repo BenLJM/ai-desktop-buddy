@@ -66,14 +66,25 @@ def extract_frames():
 
 
 def load_rgba(path: Path) -> Image.Image:
-    """Load frame and punch out the grey studio background to transparent."""
+    """Load frame, strip studio background to transparent, kill Veo watermark.
+
+    Veo's watermark sits in the bottom-right corner — light grey "Veo" text
+    that escapes the bg-grey detector and shows up as non-transparent
+    content. Blanks out the bottom-right corner so bbox / union_bbox only
+    tracks the actual sticker character.
+    """
     im = Image.open(path).convert("RGBA")
     arr = np.array(im)
     r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
     drg = np.abs(r.astype(int) - g.astype(int))
     dgb = np.abs(g.astype(int) - b.astype(int))
-    is_grey = (drg < 10) & (dgb < 10) & (r >= 210) & (r <= 250)
-    arr[is_grey, 3] = 0
+    # Loosened upper bound to 255 to catch near-white watermark text too.
+    is_bg = (drg < 12) & (dgb < 12) & (r >= 200)
+    arr[is_bg, 3] = 0
+    # Hard mask: watermark region at the bottom-right of a 1280x720 video.
+    h, w = arr.shape[:2]
+    mx, my = int(w * 0.85), int(h * 0.87)
+    arr[my:, mx:, 3] = 0
     return Image.fromarray(arr, "RGBA")
 
 
@@ -231,40 +242,48 @@ def frames_in_range(start, end, step=4, bbox=None):
 def main():
     extract_frames()
 
-    # Compute a SHARED content bbox across every frame we'll actually
-    # use. This locks the character size for the whole pack — without
-    # it, each frame's bbox is tight around its own pose, so wide poses
-    # (arms out) get scaled smaller than narrow poses (standing).
-    # Result was a visible "big-small" jitter between frames.
-    all_paths = (
-        frame_paths(4, 44, 3) +
-        frame_paths(65, 98, 3) +
-        frame_paths(112, 142, 3) +
-        frame_paths(162, 188, 3) +
-        frame_paths(48, 60, 2) +
-        frame_paths(146, 156, 2)
-    )
-    shared_bbox = union_bbox(*all_paths)
-    print(f"shared bbox: {shared_bbox} size={shared_bbox[2]-shared_bbox[0]}x{shared_bbox[3]-shared_bbox[1]}")
+    # Each state gets its OWN shared bbox — the union of every frame
+    # inside that state's window. That fixes within-state jitter
+    # (different poses no longer scale differently) without throwing
+    # away the accessory in states with a big accessory. A single
+    # whole-pack bbox had to choose: tight around the body (bulb /
+    # heart / rocket got clipped), or wide enough for accessories
+    # (body shrank to ~40 px, unusably small). Per-state bboxes let
+    # each animation fill its own canvas naturally.
+    def bbox_for(ranges):
+        paths = []
+        for start, end, step in ranges:
+            paths += frame_paths(start, end, step)
+        return union_bbox(*paths)
 
-    # ESP32 AnimatedGIF + full-frame 96x100 + SPI LCD + LittleFS I/O
-    # leaves ~150ms/frame realistic budget. 140ms/frame = stable 7 fps.
-    celebrate = frames_in_range(4, 44, step=3, bbox=shared_bbox)
+    celebrate_bbox = bbox_for([(4, 44, 3)])
+    heart_bbox     = bbox_for([(65, 98, 3)])
+    attention_bbox = bbox_for([(112, 142, 3)])
+    busy_bbox      = bbox_for([(162, 188, 3)])
+    rest_bbox      = bbox_for([(54, 58, 1), (150, 158, 1)])
+
+    for name, bb in [("celebrate", celebrate_bbox), ("heart", heart_bbox),
+                     ("attention", attention_bbox), ("busy", busy_bbox),
+                     ("rest", rest_bbox)]:
+        print(f"{name} bbox: {bb} size={bb[2]-bb[0]}x{bb[3]-bb[1]}")
+
+    # Durations chosen to match ESP32 decode budget (~150 ms/frame).
+    celebrate = frames_in_range(4, 44, step=3, bbox=celebrate_bbox)
     save_gif(celebrate, OUT_DIR / "celebrate.gif", duration=140)
 
-    heart = frames_in_range(65, 98, step=3, bbox=shared_bbox)
+    heart = frames_in_range(65, 98, step=3, bbox=heart_bbox)
     save_gif(heart, OUT_DIR / "heart.gif", duration=140)
 
-    attention = frames_in_range(112, 142, step=3, bbox=shared_bbox)
+    attention = frames_in_range(112, 142, step=3, bbox=attention_bbox)
     save_gif(attention, OUT_DIR / "attention.gif", duration=140)
 
-    busy = frames_in_range(162, 188, step=3, bbox=shared_bbox)
+    busy = frames_in_range(162, 188, step=3, bbox=busy_bbox)
     save_gif(busy, OUT_DIR / "busy.gif", duration=140)
 
-    rest = (frames_in_range(48, 60, step=2, bbox=shared_bbox) +
-            frames_in_range(146, 156, step=2, bbox=shared_bbox))
+    rest = (frames_in_range(54, 58, step=1, bbox=rest_bbox) +
+            frames_in_range(150, 158, step=1, bbox=rest_bbox))
     if not rest:
-        rest = frames_in_range(150, 156, step=1, bbox=shared_bbox)
+        rest = frames_in_range(150, 156, step=1, bbox=rest_bbox)
     for i in range(9):
         offset = (i * 2) % len(rest)
         idle_i = [rest[(offset + j) % len(rest)] for j in range(5)]

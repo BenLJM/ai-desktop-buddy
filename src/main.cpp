@@ -483,91 +483,28 @@ static void drawClock() {
   // landscape. pushFrame re-applies rotation on the next transition.
 }
 
-// pushFrame always blits the portrait sprite at setRotation(0). Every
-// menu / info / settings / boot-splash screen is designed in portrait
-// and uses this path. Landscape watch-view renders direct-to-LCD via
-// drawLandscapeMain() and bypasses this helper entirely (see main
-// loop). pushFrame stays simple on purpose — past attempts to overload
-// it for landscape (pushRotated, sprL pixel copy) interacted badly
-// with the driver's setRotation and produced either 180° flips or a
-// black screen.
+// pushFrame blits the portrait sprite to the LCD, rotating via the
+// driver when the device is held landscape. Landscape centers the
+// 135-wide sprite inside the 240-wide logical frame — bottom 105 rows
+// of the portrait sprite clip by design (that's where menus live).
+// User sees all the buddy/hud content in landscape; menus require a
+// brief tilt back to portrait.
+//
+// Cached rotation: MADCTL writes race with pushSprite on the SPI bus
+// and tear, so only re-apply setRotation when the orientation actually
+// changes.
 static uint8_t pushOrient = 0;
 static void pushFrame() {
-  if (pushOrient != 0) {
-    M5.Lcd.setRotation(0);
-    M5.Lcd.fillScreen(TFT_BLACK);
-    pushOrient = 0;
-  }
-  spr.pushSprite(0, 0);
-}
-
-// Landscape "watch" view: buddy on the left, status on the right, time
-// centered above status when the RTC is valid. Drawn direct to LCD in
-// the setRotation(clockOrient) 240x135 coord space — same proven
-// pattern as drawClock's landscape branch. Called from the main loop
-// only in DISP_NORMAL with no menu / info / session overlays.
-static uint8_t landPaintedOrient = 0;
-static void drawLandscapeMain() {
-  const Palette& p = characterPalette();
   if (pushOrient != clockOrient) {
     M5.Lcd.setRotation(clockOrient);
-    M5.Lcd.fillScreen(p.bg);
+    M5.Lcd.fillScreen(TFT_BLACK);
     pushOrient = clockOrient;
-    landPaintedOrient = clockOrient;
   }
-
-  // Pet on left (<=115 wide) at 5 fps. Matches drawClock landscape.
-  static uint32_t lastPetTick = 0;
-  uint32_t now = millis();
-  if (now - lastPetTick >= 200) {
-    lastPetTick = now;
-    if (buddyMode) {
-      M5.Lcd.fillRect(0, 0, 115, 90, p.bg);
-      buddyRenderTo(&M5.Lcd, activeState);
-    } else {
-      characterSetState(activeState);
-      characterRenderTo(&M5.Lcd, 57, 45);
-    }
-  }
-
-  // Right column: stats + connection state. Updated at 1 Hz.
-  static uint32_t lastStatTick = 0;
-  if (now - lastStatTick >= 1000) {
-    lastStatTick = now;
-    M5.Lcd.fillRect(125, 0, 240 - 125, 135, p.bg);
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextSize(1);
-
-    int y = 8;
-    if (dataRtcValid()) {
-      char hm[6];
-      snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.Hours, _clkTm.Minutes);
-      M5.Lcd.setTextSize(3);
-      M5.Lcd.setTextColor(p.text, p.bg);
-      M5.Lcd.drawString(hm, 130, y);
-      y += 28;
-      M5.Lcd.setTextSize(1);
-    }
-
-    M5.Lcd.setTextColor(p.textDim, p.bg);
-    if (!bleConnected())       M5.Lcd.drawString("no claude", 130, y);
-    else if (bleSecure())      M5.Lcd.drawString("claude \x03", 130, y);
-    else                       M5.Lcd.drawString("claude (open)", 130, y);
-    y += 12;
-
-    char buf[24];
-    snprintf(buf, sizeof(buf), "ses %u", tama.sessionsTotal);
-    M5.Lcd.drawString(buf, 130, y); y += 12;
-    snprintf(buf, sizeof(buf), "run %u", tama.sessionsRunning);
-    M5.Lcd.drawString(buf, 130, y); y += 12;
-    snprintf(buf, sizeof(buf), "lvl %u", (unsigned)stats().level);
-
-    // Battery %
-    int vBat_mV = (int)(M5.Axp.GetBatVoltage() * 1000);
-    int pct = (vBat_mV - 3200) / 10;
-    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-    snprintf(buf, sizeof(buf), "bat %d%%", pct);
-    M5.Lcd.drawString(buf, 130, y + 12);
+  if (clockOrient == 0) {
+    spr.pushSprite(0, 0);
+  } else {
+    // Center the 135-wide sprite on the 240-wide landscape LCD.
+    spr.pushSprite((M5.Lcd.width() - W) / 2, 0);
   }
 }
 
@@ -1252,26 +1189,16 @@ void loop() {
   // 2=landscape lock (see clockUpdateOrient).
   clockUpdateOrient();
   bool landscapeClock = clocking && clockOrient != 0;
-  // Landscape "watch" main view: same landscape direct-to-LCD render
-  // pattern as landscapeClock, but fires on battery too — whenever the
-  // user locks `land` (or tilts enough in auto) AND there's no overlay
-  // fighting for the screen. Menus, settings, info, passkey pairing,
-  // and pet pages all force portrait so portrait-only UI stays usable.
-  bool landscapeMain = (clockOrient != 0)
-                    && displayMode == DISP_NORMAL
-                    && !menuOpen && !settingsOpen && !resetOpen
-                    && !inPrompt && !blePasskey();
 
   static bool wasClocking = false;
   static bool wasLandscape = false;
-  bool landscapeAny = landscapeMain || landscapeClock;
-  if (clocking != wasClocking || landscapeAny != wasLandscape) {
-    if (clocking && !landscapeAny) characterSetPeek(true);
+  if (clocking != wasClocking || landscapeClock != wasLandscape) {
+    if (clocking && !landscapeClock) characterSetPeek(true);
     else applyDisplayMode();
     characterInvalidate();
     if (buddyMode) buddyInvalidate();
     wasClocking = clocking;
-    wasLandscape = landscapeAny;
+    wasLandscape = landscapeClock;
   }
   if (clocking) {
     uint8_t dow = clockDow();
@@ -1295,8 +1222,8 @@ void loop() {
   if (pk && !lastPasskey) { wake(); beep(1800, 60); }
   lastPasskey = pk;
 
-  if (napping || screenOff || landscapeClock || landscapeMain) {
-    // skip sprite render — face-down, powered off, or landscape view
+  if (napping || screenOff || landscapeClock) {
+    // skip sprite render — face-down, powered off, or landscape clock
     // (which draws direct-to-LCD below)
   } else if (buddyMode) {
     buddyTick(activeState);
@@ -1327,8 +1254,6 @@ void loop() {
   }
   if (landscapeClock) {
     drawClock();
-  } else if (landscapeMain) {
-    drawLandscapeMain();
   } else if (!napping && !screenOff) {
     if (blePasskey()) drawPasskey();
     else if (clocking) drawClock();
